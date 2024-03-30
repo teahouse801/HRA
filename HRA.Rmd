@@ -1,0 +1,323 @@
+---
+title: "HRA_data_cleaning_ and_transformation"
+output: word_document
+---
+
+```{r}
+# Load the required packages
+library(openxlsx)  
+library(dplyr)
+library(tidyr)
+
+# Load the HRA data
+hra <- read.csv('20240227_HRA.csv')
+```
+
+
+```{r}
+#-------------- ADD NEW FIELDS WITH LEGIBLE PAGE LOCATION DATA -------------------#
+
+# Read the crosswalk table into a dataframe
+crosswalk <- read.csv('page_location_cwlk.csv')
+
+# Rename the column in crosswalk
+colnames(crosswalk)[1] <- "page_location"
+
+# Left join hra with crosswalk based on page_location
+hra <- left_join(hra, crosswalk, by = "page_location")
+
+```
+
+
+```{r}
+#-------------- CLEAN DATA -------------------#
+
+# Convert date columns to Date format 
+hra$event_date <- as.Date(paste(substr(hra$event_date, 1, 4), substr(hra$event_date, 5, 6), substr(hra$event_date, 7, 8), sep = ""), format = "%Y%m%d")
+hra$user_first_touch_timestamp_converted <- as.Date(as.numeric(substr(hra$user_first_touch_timestamp, 1, nchar(hra$user_first_touch_timestamp)))/86400000000 + as.Date("1970-01-01"))
+hra$user_first_touch_timestamp_converted_time <- format(as.POSIXct(hra$user_first_touch_timestamp / 10^6, origin = "1970-01-01", tz = "UTC"), format = "%H:%M:%S", tz = "UTC")
+hra$event_timestamp_converted <- as.Date(as.numeric(substr(hra$event_timestamp, 1, nchar(hra$event_timestamp)))/86400000000 + as.Date("1970-01-01"))
+hra$event_timestamp_converted_time <- format(as.POSIXct(hra$event_timestamp / 10^6, origin = "1970-01-01", tz = "UTC"), format = "%H:%M:%S", tz = "UTC")
+
+# Create a new field for day of the week
+hra$day_of_week <- substr(weekdays(hra$event_date), 1, 3)
+
+# Create a new field based on the domain name
+hra$domain_include <- ifelse(hra$hostname %in% c("humanatlas.io", "apps.humanatlas.io"), "Include", "Exclude")
+
+# Replace missing values with an empty string
+hra$page_location_description[is.na(hra$page_location_description)] <- ""
+hra$page_location_detail[is.na(hra$page_location_detail)] <- ""
+hra$page_location_version[is.na(hra$page_location_version)] <- ""
+
+# Replace NA values with 0
+hra$user_first_touch_timestamp[is.na(hra$user_first_touch_timestamp)] <- 0
+hra$user_first_touch_timestamp_converted [is.na(hra$user_first_touch_timestamp_converted)] <- 0
+hra$user_first_touch_timestamp_converted_time[is.na(hra$user_first_touch_timestamp_converted_time)] <- 0
+
+# Filter rows where domain_include is 'Include'
+filtered_hra <- hra[hra$domain_include == 'Include', ]
+
+```
+
+
+```{r}
+#-------------- SUMMARY STATISTICS -------------------#
+
+# Calculate the total number of rows before filtering
+total_rows_before_filtering <- nrow(hra)
+
+# Calculate the total number of rows after filtering
+total_rows_after_filtering <- nrow(filtered_hra)
+
+# Function to calculate summary statistics
+calculate_summary <- function(data) {
+  distinct_ids <- n_distinct(data$user_pseudo_id)
+  session_starts <- sum(data$event_name == "session_start")
+  first_visitors <- sum(data$event_name == "first_visit")
+  returning_visitors <- session_starts - first_visitors
+  total_rows <- nrow(data)
+  return(c(distinct_ids, session_starts, first_visitors, returning_visitors, total_rows))
+}
+
+# Calculate summary statistics for apps.humanatlas.io before filtering
+apps_humanatlas_io_before <- c("apps.humanatlas.io before filtering", calculate_summary(hra %>% filter(hostname == "apps.humanatlas.io")))
+
+# Calculate summary statistics for humanatlas.io before filtering
+humanatlas_io_before <- c("humanatlas.io before filtering", calculate_summary(hra %>% filter(hostname == "humanatlas.io")))
+
+# Calculate summary statistics for overall before filtering
+overall_before <- c("Overall before filtering", calculate_summary(hra))
+
+# Calculate summary statistics for apps.humanatlas.io after filtering
+apps_humanatlas_io_after <- c("apps.humanatlas.io after filtering", calculate_summary(filtered_hra %>% filter(hostname == "apps.humanatlas.io")))
+
+# Calculate summary statistics for humanatlas.io after filtering
+humanatlas_io_after <- c("humanatlas.io after filtering", calculate_summary(filtered_hra %>% filter(hostname == "humanatlas.io")))
+
+# Calculate summary statistics for overall after filtering
+overall_after <- c("Overall after filtering", calculate_summary(filtered_hra))
+
+# Create a summary table
+summary_table <- rbind(
+  c("domain", "distinct ids", "session starts", "first visitors", "returning visitors", "total rows"),
+  apps_humanatlas_io_before,
+  humanatlas_io_before,
+  overall_before,
+  apps_humanatlas_io_after,
+  humanatlas_io_after,
+  overall_after
+)
+
+# Create a new workbook
+wb <- createWorkbook()
+
+# Add a worksheet for Summary
+addWorksheet(wb, "Summary")
+
+# Write the summary table to the worksheet
+writeData(wb, "Summary", summary_table)
+```
+
+
+```{r}
+
+#-------------- AVERAGE PAGES PER SESSION -------------------#
+
+# Calculate average number of pages per session for each domain and overall
+average_pages_per_session <- filtered_hra %>%
+  group_by(hostname) %>%
+  summarize(average_pages_per_session = sum(event_name == "page_view") / sum(event_name == "session_start"),
+            total_session_starts = sum(event_name == "session_start"))
+
+overall_average_pages_per_session <- average_pages_per_session %>%
+  summarize(average_pages_per_session = sum(average_pages_per_session * total_session_starts) / sum(total_session_starts),
+            total_session_starts = sum(total_session_starts))
+
+# Create a new worksheet for Average Pages per Session
+addWorksheet(wb, "Avg Pages per Session")
+
+# Write the data to the worksheet
+writeData(wb, "Avg Pages per Session", average_pages_per_session)
+```
+
+
+```{r}
+#-------------- ADDITIONAL DATA CLEANING NECESSARY FOR SESSION DURATION AND BOUNCE RATE CALCULATIONS -------------------#
+
+# Sort the filtered data ascending by hostname, user_pseudo_id, event_date, and event_timestamp
+# Exclude rows where event_name is first_visit. These records are no longer needed
+sorted_hra <- filtered_hra %>%
+  arrange(hostname, user_pseudo_id, event_date, event_timestamp)
+
+# Create a new worksheet for sorted_hra dataframe
+addWorksheet(wb, "Sorted HRA")
+writeData(wb, "Sorted HRA", sorted_hra)
+
+```
+
+
+```{r}
+#-------------- CREATE REFERENCE LIST OF UNIQUE SESSION DURATIONS BY HOSTNAME -------------------#
+
+# Remove duplicate rows based on user_pseudo_id, hostname, page_location, and event_timestamp
+# Keep only the rows with session_start event if duplicates exist
+filtered_sorted_hra <- sorted_hra %>%
+  distinct(user_pseudo_id, hostname, page_location, event_timestamp, .keep_all = TRUE) %>%
+  group_by(user_pseudo_id, hostname) %>%
+  mutate(session_index = cumsum(event_name == "session_start"))
+
+# Calculate time per session for each user, hostname, and session index
+time_per_session <- filtered_sorted_hra %>%
+  group_by(user_pseudo_id, hostname, session_index, event_date) %>%
+  summarize(min_timestamp = min(event_timestamp_converted),
+            max_timestamp = if_else(n() == 1, max(event_timestamp_converted), last(event_timestamp_converted)),
+            session_duration = as.numeric(difftime(max_timestamp, min_timestamp, units = "secs")),
+            session_duration_hms = sprintf("%02.0f:%02.0f:%02.0f", 
+                                           session_duration %/% 3600, 
+                                           (session_duration %% 3600) %/% 60, 
+                                           session_duration %% 60))
+
+# Create a new worksheet for individual session details
+addWorksheet(wb, "Individual Session Details")
+writeData(wb, "Individual Session Details", time_per_session)
+```
+
+
+```{r}
+#-------------- CALCULATE AVERAGE SESSION DURATION  -------------------#
+
+# Calculate average session duration for each hostname
+average_session_duration <- time_per_session %>%
+  group_by(hostname) %>%
+  summarize(average_duration_seconds = mean(session_duration, na.rm = TRUE),
+            average_duration_hms = sprintf("%02.0f:%02.0f:%02.0f", 
+                                           mean(session_duration) %/% 3600, 
+                                           (mean(session_duration) %% 3600) %/% 60, 
+                                           mean(session_duration) %% 60))
+
+# Calculate total average session duration across all hostnames
+total_average_duration <- mean(time_per_session$session_duration, na.rm = TRUE)
+
+# Add total average session duration to the dataframe
+average_session_duration <- rbind(average_session_duration, c("Total", total_average_duration, 
+                                                              sprintf("%02.0f:%02.0f:%02.0f", 
+                                                                      total_average_duration %/% 3600, 
+                                                                      (total_average_duration %% 3600) %/% 60, 
+                                                                      total_average_duration %% 60)))
+
+# Add a worksheet for average session durations
+addWorksheet(wb, "Average Session Durations")
+writeData(wb, "Average Session Durations", average_session_duration)
+```
+
+
+```{r}
+#-------------- CALCULATE BOUNCE RATE  -------------------#
+
+# Count zero duration sessions for each domain
+zero_duration_sessions_per_domain <- time_per_session %>%
+  group_by(hostname) %>%
+  filter(session_duration < 1) %>%
+  summarize(zero_duration = n())
+
+# Count number of session starts for each domain
+session_starts_per_domain <- time_per_session %>%
+  group_by(hostname) %>%
+  summarize(session_starts = n())
+
+# Merge the data frames for zero duration sessions and session starts by hostname
+domain_rows <- merge(zero_duration_sessions_per_domain, session_starts_per_domain, by = "hostname", all = TRUE)
+
+# Calculate the ratio for each domain
+domain_rows <- domain_rows %>%
+  mutate(ratio = if_else(!is.na(zero_duration), zero_duration / session_starts, NA_real_))
+
+# Calculate the total values
+total_values <- domain_rows %>%
+  summarize(zero_duration = sum(zero_duration, na.rm = TRUE),
+            session_starts = sum(session_starts, na.rm = TRUE),
+            ratio = zero_duration / session_starts)
+
+# Add a "Total" row
+total_values <- mutate(total_values, hostname = "Total")
+
+# Bind rows
+result <- bind_rows(domain_rows, total_values) %>%
+  select(hostname, zero_duration, session_starts, ratio)
+
+# Add a worksheet
+addWorksheet(wb, "Bounce Rate")
+
+# Write the data to the worksheet
+writeData(wb, "Bounce Rate", result)
+```
+
+
+```{r}
+#-------------- DISPLAY SESSION PATH DATA -------------------#
+
+# Filter event_name to only include session_start and page_view
+session_view_data <- sorted_hra %>%
+  filter(event_name %in% c("session_start", "page_view"))
+
+# Create a new column to identify duplicates
+session_view_data <- session_view_data %>%
+  group_by(user_pseudo_id, hostname, page_location, event_timestamp) %>%
+  mutate(duplicate = ifelse(n() > 1 & event_name == "page_view", "duplicate", "unique")) %>%
+  ungroup() %>%
+  filter(!(duplicate == "duplicate" & event_name == "page_view"))
+
+# Create a new column to track the index
+session_view_data <- session_view_data %>%
+  mutate(index = ifelse(event_name == "session_start", 1, NA_integer_))
+
+# Function to advance index for each row until the next session_start
+advance_index <- function(data) {
+  index <- 1
+  for (i in seq_along(data$index)) {
+    if (!is.na(data$index[i])) {
+      index <- data$index[i]
+    } else {
+      index <- index + 1
+    }
+    data$index[i] <- index
+  }
+  return(data)
+}
+
+# Apply the function to advance the index
+session_view_data <- session_view_data %>%
+  group_by(hostname, user_pseudo_id) %>%
+  arrange(event_timestamp) %>%
+  do(advance_index(.)) %>%
+  ungroup()
+
+# Add a worksheet for session exploration
+addWorksheet(wb, "Session Exploration")
+
+# Write session exploration data to the worksheet
+writeData(wb, "Session Exploration", session_view_data)
+
+# Pivot the data to transform each unique page visit into a separate column
+session_path <- session_view_data %>%
+  group_by(user_pseudo_id, event_date, hostname, index) %>%
+  summarize(page_location_description = paste(page_location_description, collapse = "; ")) %>%
+  pivot_wider(names_from = index, values_from = page_location_description, names_prefix = "step_") %>%
+  ungroup()
+
+# Add a worksheet for the session path data
+addWorksheet(wb, "Session Path Data")
+
+# Write the session path data to the worksheet
+writeData(wb, "Session Path Data", session_path)
+
+```
+
+
+```{r}
+# Save the workbook to load into PowerBI
+saveWorkbook(wb, "Session_Details 3.xlsx", overwrite = TRUE)
+
+```
+

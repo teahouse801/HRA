@@ -124,15 +124,18 @@ writeData(wb, "Summary", summary_table)
 
 #-------------- AVERAGE PAGES PER SESSION -------------------#
 
-# Calculate average number of pages per session for each domain and overall
+# Calculate average number of pages per session for each domain
 average_pages_per_session <- filtered_hra %>%
   group_by(hostname) %>%
   summarize(average_pages_per_session = sum(event_name == "page_view") / sum(event_name == "session_start"),
             total_session_starts = sum(event_name == "session_start"))
 
-overall_average_pages_per_session <- average_pages_per_session %>%
-  summarize(average_pages_per_session = sum(average_pages_per_session * total_session_starts) / sum(total_session_starts),
-            total_session_starts = sum(total_session_starts))
+# Calculate overall average pages per session
+overall_average_pages <- sum(average_pages_per_session$average_pages_per_session * average_pages_per_session$total_session_starts) / sum(average_pages_per_session$total_session_starts)
+
+# Add total row for overall average pages per session
+overall_row <- c("Total", overall_average_pages, NA)
+average_pages_per_session <- rbind(average_pages_per_session, overall_row)
 
 # Create a new worksheet for Average Pages per Session
 addWorksheet(wb, "Avg Pages per Session")
